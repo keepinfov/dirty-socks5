@@ -64,29 +64,28 @@ async fn main() -> anyhow::Result<()> {
 
 // RFC-1929 Implementation
 async fn auth_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
-    let mut buf = [0u8; 515];
-    match stream.read(&mut buf).await {
-        Ok(0) | Err(_) => return Ok(()),
-        Ok(_n) => {
-            if buf[0] != 0x01 {
-                return Ok(());
-            }
-            let ulen = buf[1] as usize;
-            let uname: &str = &(String::from_utf8(buf[2..ulen + 2].to_vec())?);
-            let plen = buf[2 + ulen] as usize;
-            let passwd: &str =
-                &(String::from_utf8(buf[2 + ulen + 1..2 + ulen + 1 + plen].to_vec())?);
+    if stream.read_u8().await? != 0x01 {
+        return Ok(());
+    }
 
-            if uname == UNAME && passwd == PASSWD {
-                log::info!("{} successfully authentificated!", stream.peer_addr()?.ip());
-                stream.write(&[0x01, 0x00]).await?;
-                request_handle(stream).await
-            } else {
-                stream.write(&[0x01, 0x67]).await?;
-                stream.shutdown().await?;
-                return Ok(());
-            }
-        }
+    let ulen = stream.read_u8().await? as usize;
+
+    let mut uname = vec![0u8; ulen];
+    stream.read_exact(&mut uname).await?;
+
+    let plen = stream.read_u8().await? as usize;
+
+    let mut passwd = vec![0u8; plen];
+    stream.read_exact(&mut passwd).await?;
+
+    if uname == UNAME.as_bytes() && passwd == PASSWD.as_bytes() {
+        log::info!("{} successfully authentificated!", stream.peer_addr()?.ip());
+        stream.write(&[0x01, 0x00]).await?;
+        request_handle(stream).await
+    } else {
+        stream.write(&[0x01, 0x67]).await?;
+        stream.shutdown().await?;
+        return Ok(());
     }
 }
 
