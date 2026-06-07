@@ -25,40 +25,38 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::spawn(async move {
             count.fetch_add(1, Ordering::Relaxed);
-            let mut buf = [0u8; 256 + 2];
 
-            match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => return Ok(()),
-                Ok(_n) => {
-                    if buf[0] != 0x05 {
-                        return Ok(());
-                    }
+            if stream.read_u8().await? != 0x05 {
+                return Ok(());
+            }
 
-                    let nmethods = buf[1];
-                    let methods = &buf[2..(nmethods + 2) as usize];
-                    match (
-                        AUTH_ENABLED,
-                        methods.contains(&0x00),
-                        methods.contains(&0x02),
-                    ) {
-                        (true, _, true) => {
-                            stream.write(&[0x05, 0x02]).await?;
-                            auth_handle(&mut stream).await?;
-                        }
-                        (false, true, _) => {
-                            stream.write(&[0x05, 0x00]).await?;
-                            request_handle(&mut stream).await?;
-                        }
-                        _ => {
-                            stream.write(&[0x05, 0xff]).await?;
-                            return Ok(());
-                        }
-                    }
+            let nmethods = stream.read_u8().await? as usize;
+
+            let mut methods = vec![0u8; nmethods];
+            stream.read_exact(&mut methods).await?;
+
+            match (
+                AUTH_ENABLED,
+                methods.contains(&0x00),
+                methods.contains(&0x02),
+            ) {
+                (true, _, true) => {
+                    stream.write(&[0x05, 0x02]).await?;
+                    auth_handle(&mut stream).await?;
+                }
+                (false, true, _) => {
+                    stream.write(&[0x05, 0x00]).await?;
+                    request_handle(&mut stream).await?;
+                }
+                _ => {
+                    stream.write(&[0x05, 0xff]).await?;
+                    return Ok(());
                 }
             }
 
             let remaining = count.fetch_sub(1, Ordering::Relaxed) - 1;
             log::info!("{} disconnected (active {})", addr, remaining);
+
             Ok::<(), anyhow::Error>(())
         });
     }
