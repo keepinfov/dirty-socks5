@@ -181,7 +181,43 @@ async fn request_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
 
                             Ok(())
                         }
-                        0x04 => todo!("IP V6"),
+                        0x04 => {
+                            let address = std::net::SocketAddrV6::new(
+                                std::net::Ipv6Addr::from_octets(buf[4..20].try_into().unwrap()),
+                                u16::from_be_bytes(buf[20..22].try_into().unwrap()),
+                                0,
+                                0,
+                            );
+
+                            let mut out_stream = TcpStream::connect(address).await?;
+                            let mut response = Vec::new();
+                            response.push(0x05);
+                            response.push(0x00);
+                            response.push(0x00);
+
+                            let local_addr = out_stream.local_addr()?;
+                            let ip = local_addr.ip();
+                            let port = local_addr.port();
+
+                            match ip {
+                                std::net::IpAddr::V4(ipv4) => {
+                                    response.push(0x01);
+                                    response.extend_from_slice(&ipv4.octets());
+                                }
+                                std::net::IpAddr::V6(ipv6) => {
+                                    response.push(0x04);
+                                    response.extend_from_slice(&ipv6.octets());
+                                }
+                            }
+                            response.extend_from_slice(&port.to_be_bytes());
+
+                            stream.write_all(&response).await?;
+                            stream.flush().await?;
+
+                            copy_bidirectional(stream, &mut out_stream).await?;
+
+                            Ok(())
+                        }
                         _ => {
                             stream
                                 .write(&[
