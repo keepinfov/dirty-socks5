@@ -2,6 +2,7 @@ use tokio::io::copy_bidirectional;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 const AUTH_ENABLED: bool = true;
@@ -90,152 +91,86 @@ async fn auth_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
 }
 
 async fn request_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
-    let mut buf = [0u8; 263];
-    match stream.read(&mut buf).await {
-        Ok(0) | Err(_) => return Ok(()),
-        Ok(_n) => {
-            if buf[0] != 0x05 {
-                return Ok(());
-            }
-            let cmd = buf[1];
-            match cmd {
+    if stream.read_u8().await? != 0x05 {
+        return Ok(());
+    }
+
+    let cmd = stream.read_u8().await?;
+    match cmd {
+        0x01 => {
+            let _rsv = stream.read_u8().await?;
+            let atyp = stream.read_u8().await?;
+
+            let address_ip = match atyp {
                 0x01 => {
-                    let atyp = buf[3];
-                    match atyp {
-                        0x01 => {
-                            let address = format!(
-                                "{}.{}.{}.{}:{}",
-                                buf[4],
-                                buf[5],
-                                buf[6],
-                                buf[7],
-                                u16::from_be_bytes([buf[8], buf[9]])
-                            );
-                            let mut out_stream = TcpStream::connect(address).await?;
-                            let mut response = Vec::new();
-                            response.push(0x05);
-                            response.push(0x00);
-                            response.push(0x00);
-
-                            let local_addr = out_stream.local_addr()?;
-                            let ip = local_addr.ip();
-                            let port = local_addr.port();
-
-                            match ip {
-                                std::net::IpAddr::V4(ipv4) => {
-                                    response.push(0x01);
-                                    response.extend_from_slice(&ipv4.octets());
-                                }
-                                std::net::IpAddr::V6(ipv6) => {
-                                    response.push(0x04);
-                                    response.extend_from_slice(&ipv6.octets());
-                                }
-                            }
-                            response.extend_from_slice(&port.to_be_bytes());
-
-                            stream.write_all(&response).await?;
-                            stream.flush().await?;
-
-                            copy_bidirectional(stream, &mut out_stream).await?;
-
-                            Ok(())
-                        }
-                        0x03 => {
-                            let dlen = buf[4] as usize;
-                            let domain = String::from_utf8(buf[5..5 + dlen].to_vec())?;
-                            let port = u16::from_be_bytes([buf[5 + dlen], buf[5 + dlen + 1]]);
-
-                            let address = lookup_host(format!("{}:{}", domain, port))
-                                .await?
-                                .next()
-                                .unwrap();
-                            let mut out_stream = TcpStream::connect(address).await?;
-                            let mut response = Vec::new();
-                            response.push(0x05);
-                            response.push(0x00);
-                            response.push(0x00);
-
-                            let local_addr = out_stream.local_addr()?;
-                            let ip = local_addr.ip();
-                            let port = local_addr.port();
-
-                            match ip {
-                                std::net::IpAddr::V4(ipv4) => {
-                                    response.push(0x01);
-                                    response.extend_from_slice(&ipv4.octets());
-                                }
-                                std::net::IpAddr::V6(ipv6) => {
-                                    response.push(0x04);
-                                    response.extend_from_slice(&ipv6.octets());
-                                }
-                            }
-                            response.extend_from_slice(&port.to_be_bytes());
-
-                            stream.write_all(&response).await?;
-                            stream.flush().await?;
-
-                            copy_bidirectional(stream, &mut out_stream).await?;
-
-                            Ok(())
-                        }
-                        0x04 => {
-                            let address = std::net::SocketAddrV6::new(
-                                std::net::Ipv6Addr::from_octets(buf[4..20].try_into().unwrap()),
-                                u16::from_be_bytes(buf[20..22].try_into().unwrap()),
-                                0,
-                                0,
-                            );
-
-                            let mut out_stream = TcpStream::connect(address).await?;
-                            let mut response = Vec::new();
-                            response.push(0x05);
-                            response.push(0x00);
-                            response.push(0x00);
-
-                            let local_addr = out_stream.local_addr()?;
-                            let ip = local_addr.ip();
-                            let port = local_addr.port();
-
-                            match ip {
-                                std::net::IpAddr::V4(ipv4) => {
-                                    response.push(0x01);
-                                    response.extend_from_slice(&ipv4.octets());
-                                }
-                                std::net::IpAddr::V6(ipv6) => {
-                                    response.push(0x04);
-                                    response.extend_from_slice(&ipv6.octets());
-                                }
-                            }
-                            response.extend_from_slice(&port.to_be_bytes());
-
-                            stream.write_all(&response).await?;
-                            stream.flush().await?;
-
-                            copy_bidirectional(stream, &mut out_stream).await?;
-
-                            Ok(())
-                        }
-                        _ => {
-                            stream
-                                .write(&[
-                                    0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                ])
-                                .await?;
-                            stream.shutdown().await?;
-                            return Ok(());
-                        }
-                    }
+                    let mut ipv4_buf = [0u8; 4];
+                    stream.read_exact(&mut ipv4_buf).await?;
+                    IpAddr::V4(Ipv4Addr::from_octets(ipv4_buf))
                 }
-                0x02 => todo!("CMD BIND"),
-                0x03 => todo!("CMD UDP ASSOCIATE"),
+                0x03 => {
+                    let dlen = stream.read_u8().await? as usize;
+
+                    let mut domain_buf = vec![0u8; dlen];
+                    stream.read_exact(&mut domain_buf).await?;
+                    let domain = String::from_utf8(domain_buf)?;
+
+                    lookup_host((domain, 0)).await?.next().unwrap().ip()
+                }
+                0x04 => {
+                    let mut ipv6_buf = [0u8; 16];
+                    stream.read_exact(&mut ipv6_buf).await?;
+                    IpAddr::V6(Ipv6Addr::from_octets(ipv6_buf))
+                }
                 _ => {
                     stream
-                        .write(&[0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                        .write(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
                         .await?;
                     stream.shutdown().await?;
                     return Ok(());
                 }
+            };
+
+            let mut address_port = [0u8; 2];
+            stream.read_exact(&mut address_port).await?;
+            let address_port = u16::from_be_bytes(address_port);
+
+            let address = SocketAddr::new(address_ip, address_port);
+            let mut out_stream = TcpStream::connect(address).await?;
+
+            let mut response = Vec::new();
+            response.extend_from_slice(&[0x05, 0x00, 0x00]);
+
+            let local_addr = out_stream.local_addr()?;
+            let ip = local_addr.ip();
+            let port = local_addr.port();
+
+            match ip {
+                IpAddr::V4(ipv4) => {
+                    response.push(0x01);
+                    response.extend_from_slice(&ipv4.octets());
+                }
+                IpAddr::V6(ipv6) => {
+                    response.push(0x04);
+                    response.extend_from_slice(&ipv6.octets());
+                }
             }
+            response.extend_from_slice(&port.to_be_bytes());
+
+            stream.write_all(&response).await?;
+            stream.flush().await?;
+
+            copy_bidirectional(stream, &mut out_stream).await?;
+
+            Ok(())
+        }
+        0x02 => todo!("CMD BIND request handle"),
+        0x03 => todo!("CMD UDP ASSOCIATE request handle"),
+        _ => {
+            stream
+                .write(&[0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                .await?;
+            stream.shutdown().await?;
+            return Ok(());
         }
     }
 }
