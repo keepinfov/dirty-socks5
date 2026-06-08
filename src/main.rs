@@ -9,6 +9,67 @@ const AUTH_ENABLED: bool = true;
 const UNAME: &str = "user";
 const PASSWD: &str = "password";
 
+const RFC1928_VER: u8 = 0x05;
+const RFC1929_VER: u8 = 0x01;
+
+#[repr(u8)]
+enum AuthMethods {
+    NoAuthRequired = 0x00,
+    UsernamePassword = 0x02,
+    NoAcceptableMethod = 0xff
+}
+
+#[repr(u8)]
+enum Cmd {
+    Connect = 0x01,
+    Bind = 0x02,
+    UdpAssociate = 0x03,
+}
+
+impl TryFrom<u8> for Cmd {
+    type Error = u8;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(Cmd::Connect),
+            0x03 => Ok(Cmd::Bind),
+            0x04 => Ok(Cmd::UdpAssociate),
+            other => Err(other),
+        }
+    }
+}
+
+#[repr(u8)]
+enum AddrType {
+    IPv4 = 0x01,
+    Domain = 0x03,
+    IPv6 = 0x04,
+}
+
+impl TryFrom<u8> for AddrType {
+    type Error = u8;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(AddrType::IPv4),
+            0x03 => Ok(AddrType::Domain),
+            0x04 => Ok(AddrType::IPv6),
+            other => Err(other),
+        }
+    }
+}
+
+#[repr(u8)]
+enum Reply {
+    Succeeded = 0x00,
+    GeneralServerFailure = 0x01,
+    ConnectionNotALlowed = 0x02,
+    NetworkUnreachable = 0x03,
+    HostUnreachable = 0x04,
+    ConnectionRefused = 0x05,
+    TTLExpired = 0x06,
+    CommandNotSupported = 0x07,
+    AddrTypeNotSupported = 0x08
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
@@ -27,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             count.fetch_add(1, Ordering::Relaxed);
 
-            if stream.read_u8().await? != 0x05 {
+            if stream.read_u8().await? != RFC1928_VER {
                 return Ok(());
             }
 
@@ -38,19 +99,19 @@ async fn main() -> anyhow::Result<()> {
 
             match (
                 AUTH_ENABLED,
-                methods.contains(&0x00),
-                methods.contains(&0x02),
+                methods.contains(&(AuthMethods::NoAuthRequired as u8)),
+                methods.contains(&(AuthMethods::UsernamePassword as u8)),
             ) {
                 (true, _, true) => {
-                    stream.write(&[0x05, 0x02]).await?;
+                    stream.write(&[RFC1928_VER, AuthMethods::UsernamePassword as u8]).await?;
                     auth_handle(&mut stream).await?;
                 }
                 (false, true, _) => {
-                    stream.write(&[0x05, 0x00]).await?;
+                    stream.write(&[RFC1928_VER, AuthMethods::NoAuthRequired as u8]).await?;
                     request_handle(&mut stream).await?;
                 }
                 _ => {
-                    stream.write(&[0x05, 0xff]).await?;
+                    stream.write(&[RFC1928_VER, AuthMethods::NoAcceptableMethod as u8]).await?;
                     return Ok(());
                 }
             }
@@ -65,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
 
 // RFC-1929 Implementation
 async fn auth_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
-    if stream.read_u8().await? != 0x01 {
+    if stream.read_u8().await? != RFC1929_VER {
         return Ok(());
     }
 
@@ -81,33 +142,33 @@ async fn auth_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
 
     if uname == UNAME.as_bytes() && passwd == PASSWD.as_bytes() {
         log::info!("{} successfully authentificated!", stream.peer_addr()?.ip());
-        stream.write(&[0x01, 0x00]).await?;
+        stream.write(&[RFC1929_VER, 0x00]).await?;
         request_handle(stream).await
     } else {
-        stream.write(&[0x01, 0x67]).await?;
+        stream.write(&[RFC1929_VER, 0x67]).await?;
         stream.shutdown().await?;
         return Ok(());
     }
 }
 
 async fn request_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
-    if stream.read_u8().await? != 0x05 {
+    if stream.read_u8().await? != RFC1928_VER {
         return Ok(());
     }
 
     let cmd = stream.read_u8().await?;
-    match cmd {
-        0x01 => {
+    match Cmd::try_from(cmd) {
+        Ok(Cmd::Connect) => {
             let _rsv = stream.read_u8().await?;
             let atyp = stream.read_u8().await?;
 
-            let address_ip = match atyp {
-                0x01 => {
+            let address_ip = match AddrType::try_from(atyp) {
+                Ok(AddrType::IPv4) => {
                     let mut ipv4_buf = [0u8; 4];
                     stream.read_exact(&mut ipv4_buf).await?;
                     IpAddr::V4(Ipv4Addr::from_octets(ipv4_buf))
                 }
-                0x03 => {
+                Ok(AddrType::Domain) => {
                     let dlen = stream.read_u8().await? as usize;
 
                     let mut domain_buf = vec![0u8; dlen];
@@ -116,14 +177,14 @@ async fn request_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
 
                     lookup_host((domain, 0)).await?.next().unwrap().ip()
                 }
-                0x04 => {
+                Ok(AddrType::IPv4) => {
                     let mut ipv6_buf = [0u8; 16];
                     stream.read_exact(&mut ipv6_buf).await?;
                     IpAddr::V6(Ipv6Addr::from_octets(ipv6_buf))
                 }
-                _ => {
+                Err(_) => {
                     stream
-                        .write(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                        .write(&[RFC1928_VER, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
                         .await?;
                     stream.shutdown().await?;
                     return Ok(());
@@ -138,7 +199,7 @@ async fn request_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
             let mut out_stream = TcpStream::connect(address).await?;
 
             let mut response = Vec::new();
-            response.extend_from_slice(&[0x05, 0x00, 0x00]);
+            response.extend_from_slice(&[RFC1928_VER, Reply::Succeeded as u8, 0x00]);
 
             let local_addr = out_stream.local_addr()?;
             let ip = local_addr.ip();
@@ -146,11 +207,11 @@ async fn request_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
 
             match ip {
                 IpAddr::V4(ipv4) => {
-                    response.push(0x01);
+                    response.push(AddrType::IPv4 as u8);
                     response.extend_from_slice(&ipv4.octets());
                 }
                 IpAddr::V6(ipv6) => {
-                    response.push(0x04);
+                    response.push(AddrType::IPv6 as u8);
                     response.extend_from_slice(&ipv6.octets());
                 }
             }
@@ -163,11 +224,11 @@ async fn request_handle(stream: &mut TcpStream) -> anyhow::Result<()> {
 
             Ok(())
         }
-        0x02 => todo!("CMD BIND request handle"),
-        0x03 => todo!("CMD UDP ASSOCIATE request handle"),
+        Ok(Cmd::Bind) => todo!("CMD BIND request handle"),
+        Ok(Cmd::UdpAssociate) => todo!("CMD UDP ASSOCIATE request handle"),
         _ => {
             stream
-                .write(&[0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                .write(&[RFC1928_VER, Reply::CommandNotSupported as u8, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
                 .await?;
             stream.shutdown().await?;
             return Ok(());
